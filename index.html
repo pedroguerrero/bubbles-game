@@ -35,18 +35,20 @@
     <canvas id="c"></canvas>
     <script>
       // ── Constants ──────────────────────────────────────────────────────────────
-      const R = 20; // bubble radius
-      const D = R * 2; // bubble diameter
-      const COLS = 11; // columns in even rows
-      const ROWS = 13; // grid rows (0-indexed)
-      const ROW_H = R * Math.sqrt(3); // vertical distance between row centers ≈ 34.64
-      const W = COLS * D; // canvas width = 440
-      const H = 600; // canvas height
-      const TOP = 45; // y of row-0 centers
-      const SX = W / 2; // shooter x
-      const SY = H - 65; // shooter y
+      const R = 20;
+      const D = R * 2;
+      const COLS = 11;
+      const ROWS = 13;
+      const ROW_H = R * Math.sqrt(3);
+      const W = COLS * D;
+      const H = 600;
+      const TOP = 45;
+      const SX = W / 2;
+      const SY = H - 65;
       const SPEED = 10;
-      const INIT_ROWS = 5;
+      const MAX_STAGES = 10;
+      const STONE = '#888888';
+      const WILD = 'wild';
       const COLORS = [
         '#e74c3c',
         '#3498db',
@@ -56,21 +58,22 @@
         '#e67e22',
       ];
 
+      // Wildcard button (right of shooter)
+      const WBTN = { x: W - 48, y: SY, r: 20 };
+
+      // ── Canvas ─────────────────────────────────────────────────────────────────
       const canvas = document.getElementById('c');
       const ctx = canvas.getContext('2d');
       let scale = 1;
 
       function resize() {
         const aspect = W / H;
-        let cw = window.innerWidth;
-        let ch = window.innerHeight;
+        let cw = window.innerWidth,
+          ch = window.innerHeight;
         if (cw / ch > aspect) cw = ch * aspect;
         else ch = cw / aspect;
-
         canvas.style.width = Math.round(cw) + 'px';
         canvas.style.height = Math.round(ch) + 'px';
-
-        // Match canvas internal resolution to real screen pixels (handles HiDPI/Retina)
         const dpr = window.devicePixelRatio || 1;
         canvas.width = Math.round(cw * dpr);
         canvas.height = Math.round(ch * dpr);
@@ -79,26 +82,47 @@
       window.addEventListener('resize', resize);
       resize();
 
+      // ── Stage config ───────────────────────────────────────────────────────────
+      //   dropEvery: disparos entre cada fila nueva (0 = sin auto-bajada)
+      function stageCfg(s) {
+        const i = s - 1;
+        const numColors = [3, 3, 4, 4, 5, 5, 6, 6, 6, 6][i] ?? 6;
+        const initRows = [3, 4, 4, 5, 5, 6, 6, 7, 8, 9][i] ?? 9;
+        const dropEvery = [0, 0, 14, 12, 10, 8, 7, 6, 5, 4][i] ?? 4;
+        const stoneChance = s >= 6 ? Math.min((s - 5) * 0.07, 0.25) : 0;
+        return {
+          colors: COLORS.slice(0, numColors),
+          initRows,
+          dropEvery,
+          stoneChance,
+        };
+      }
+
       // ── State ──────────────────────────────────────────────────────────────────
-      let grid, cur, nxt, mx, my, score, state, particles;
-      // state: 'play' | 'over' | 'win'
+      let grid, cur, nxt, mx, my, state, particles;
+      let stage, totalScore, stageScore, wildcards;
+      let dropParity, shotCount, streak, streakTimer, cfg;
+      // state: 'play' | 'clear' | 'over' | 'win'
 
       // ── Grid helpers ───────────────────────────────────────────────────────────
+      // dropParity flips each time a row is added at top, keeping visual hex offsets correct
       function ncols(r) {
-        return r % 2 === 0 ? COLS : COLS - 1;
+        return (r + dropParity) % 2 === 0 ? COLS : COLS - 1;
       }
       function bx(r, c) {
-        return c * D + R + (r % 2 === 1 ? R : 0);
+        return c * D + R + ((r + dropParity) % 2 === 1 ? R : 0);
       }
       function by(r) {
         return TOP + r * ROW_H;
       }
-      function rndColor() {
-        return COLORS[Math.floor(Math.random() * COLORS.length)];
+
+      function rndCfgColor() {
+        if (Math.random() < cfg.stoneChance) return STONE;
+        return cfg.colors[Math.floor(Math.random() * cfg.colors.length)];
       }
 
       function neighbors(r, c) {
-        const odd = r % 2 === 1;
+        const odd = (r + dropParity) % 2 === 1;
         return [
           [r, c - 1],
           [r, c + 1],
@@ -112,6 +136,7 @@
       }
 
       function bfsMatch(r0, c0, color) {
+        if (color === STONE) return [];
         const seen = new Set(),
           q = [[r0, c0]],
           out = [];
@@ -120,10 +145,10 @@
             k = r + ',' + c;
           if (seen.has(k)) continue;
           seen.add(k);
-          if (grid[r][c] !== color) continue;
+          if (!grid[r] || grid[r][c] !== color) continue;
           out.push([r, c]);
           for (const [nr, nc] of neighbors(r, c))
-            if (!seen.has(nr + ',' + nc) && grid[nr][nc] === color)
+            if (!seen.has(nr + ',' + nc) && grid[nr] && grid[nr][nc] === color)
               q.push([nr, nc]);
         }
         return out;
@@ -132,14 +157,16 @@
       function ceilingReachable() {
         const seen = new Set(),
           q = [];
-        for (let c = 0; c < ncols(0); c++) if (grid[0][c]) q.push([0, c]);
+        for (let c = 0; c < ncols(0); c++)
+          if (grid[0] && grid[0][c]) q.push([0, c]);
         while (q.length) {
           const [r, c] = q.shift(),
             k = r + ',' + c;
           if (seen.has(k)) continue;
           seen.add(k);
           for (const [nr, nc] of neighbors(r, c))
-            if (!seen.has(nr + ',' + nc) && grid[nr][nc]) q.push([nr, nc]);
+            if (!seen.has(nr + ',' + nc) && grid[nr] && grid[nr][nc])
+              q.push([nr, nc]);
         }
         return seen;
       }
@@ -149,9 +176,10 @@
           bestD = Infinity;
         for (let r = 0; r < ROWS; r++) {
           for (let c = 0; c < ncols(r); c++) {
-            if (grid[r][c]) continue;
+            if (grid[r] && grid[r][c]) continue;
             const valid =
-              r === 0 || neighbors(r, c).some(([nr, nc]) => grid[nr][nc]);
+              r === 0 ||
+              neighbors(r, c).some(([nr, nc]) => grid[nr] && grid[nr][nc]);
             if (!valid) continue;
             const d = (px - bx(r, c)) ** 2 + (py - by(r)) ** 2;
             if (d < bestD) {
@@ -163,8 +191,23 @@
         return best;
       }
 
+      // ── Drop row ───────────────────────────────────────────────────────────────
+      function dropRow() {
+        dropParity ^= 1;
+        const newRow = Array.from({ length: ncols(0) }, rndCfgColor);
+        grid.unshift(newRow);
+        grid.pop();
+        for (let rr = ROWS - 3; rr < ROWS; rr++)
+          for (let cc = 0; cc < ncols(rr); cc++)
+            if (grid[rr] && grid[rr][cc]) {
+              state = 'over';
+              return;
+            }
+      }
+
       // ── Particles ──────────────────────────────────────────────────────────────
       function burst(px, py, color) {
+        const col = color === STONE ? '#aaa' : color === WILD ? '#fff' : color;
         for (let i = 0; i < 10; i++) {
           const a = Math.random() * Math.PI * 2,
             s = 2 + Math.random() * 5;
@@ -173,7 +216,7 @@
             y: py,
             vx: Math.cos(a) * s,
             vy: Math.sin(a) * s,
-            color,
+            color: col,
             r: 3 + Math.random() * 4,
             life: 1,
           });
@@ -181,34 +224,65 @@
       }
 
       // ── Game logic ─────────────────────────────────────────────────────────────
+      function resolveWild(r, c) {
+        const count = {};
+        for (const [nr, nc] of neighbors(r, c)) {
+          const col = grid[nr] && grid[nr][nc];
+          if (col && col !== STONE && col !== WILD)
+            count[col] = (count[col] || 0) + 1;
+        }
+        const entries = Object.entries(count);
+        return entries.length
+          ? entries.reduce((a, b) => (b[1] > a[1] ? b : a))[0]
+          : cfg.colors[0];
+      }
+
       function place(r, c, color) {
+        if (!grid[r]) return;
+        if (color === WILD) color = resolveWild(r, c);
         grid[r][c] = color;
 
         const match = bfsMatch(r, c, color);
         if (match.length >= 3) {
+          streak++;
+          streakTimer = 90;
+          const multi = streak >= 5 ? 3 : streak >= 3 ? 2 : 1;
           for (const [mr, mc] of match) {
             burst(bx(mr, mc), by(mr), grid[mr][mc]);
             grid[mr][mc] = null;
-            score += 10;
+            stageScore += 10 * multi;
           }
           const connected = ceilingReachable();
           for (let rr = 0; rr < ROWS; rr++)
             for (let cc = 0; cc < ncols(rr); cc++)
-              if (grid[rr][cc] && !connected.has(rr + ',' + cc)) {
+              if (grid[rr] && grid[rr][cc] && !connected.has(rr + ',' + cc)) {
                 burst(bx(rr, cc), by(rr), grid[rr][cc]);
                 grid[rr][cc] = null;
-                score += 5;
+                stageScore += 5 * multi;
               }
+        } else {
+          streak = 0;
         }
 
-        if (!grid.some((row) => row.some((v) => v))) {
-          state = 'win';
+        // Stage clear when all non-stone bubbles are gone
+        const allClear = !grid.some(
+          (row) => row && row.some((v) => v && v !== STONE),
+        );
+        if (allClear) {
+          for (let rr = 0; rr < ROWS; rr++)
+            for (let cc = 0; cc < ncols(rr); cc++)
+              if (grid[rr] && grid[rr][cc] === STONE) {
+                burst(bx(rr, cc), by(rr), STONE);
+                grid[rr][cc] = null;
+              }
+          totalScore += stageScore;
+          state = stage >= MAX_STAGES ? 'win' : 'clear';
           return;
         }
 
         for (let rr = ROWS - 3; rr < ROWS; rr++)
           for (let cc = 0; cc < ncols(rr); cc++)
-            if (grid[rr][cc]) {
+            if (grid[rr] && grid[rr][cc]) {
               state = 'over';
               return;
             }
@@ -223,6 +297,14 @@
         cur.vx = (dx / len) * SPEED;
         cur.vy = (dy / len) * SPEED;
         cur.moving = true;
+        shotCount++;
+        if (cfg.dropEvery > 0 && shotCount % cfg.dropEvery === 0) dropRow();
+      }
+
+      function useWildcard() {
+        if (wildcards <= 0 || cur.moving) return;
+        wildcards--;
+        cur.color = WILD;
       }
 
       function nextBubble() {
@@ -232,10 +314,18 @@
         cur.vx = 0;
         cur.vy = 0;
         cur.moving = false;
-        nxt = { x: 0, y: 0, vx: 0, vy: 0, color: rndColor(), moving: false };
+        nxt = {
+          x: 0,
+          y: 0,
+          vx: 0,
+          vy: 0,
+          color: cfg.colors[Math.floor(Math.random() * cfg.colors.length)],
+          moving: false,
+        };
       }
 
       function update() {
+        if (streakTimer > 0) streakTimer--;
         particles = particles.filter((p) => {
           p.x += p.vx;
           p.y += p.vy;
@@ -243,12 +333,10 @@
           p.life -= 0.025;
           return p.life > 0;
         });
-
-        if (!cur.moving) return;
+        if (state !== 'play' || !cur.moving) return;
 
         cur.x += cur.vx;
         cur.y += cur.vy;
-
         if (cur.x < R) {
           cur.x = R;
           cur.vx = Math.abs(cur.vx);
@@ -258,16 +346,14 @@
           cur.vx = -Math.abs(cur.vx);
         }
 
-        // Hit ceiling → snap to row 0 area
         if (cur.y <= TOP + R) {
           const s = snap(cur.x, by(0));
           if (s) place(s[0], s[1], cur.color);
           nextBubble();
           return;
         }
-
-        // Collision with grid bubbles
-        for (let r = 0; r < ROWS; r++)
+        for (let r = 0; r < ROWS; r++) {
+          if (!grid[r]) continue;
           for (let c = 0; c < ncols(r); c++)
             if (
               grid[r][c] &&
@@ -278,6 +364,7 @@
               nextBubble();
               return;
             }
+        }
       }
 
       // ── Drawing ────────────────────────────────────────────────────────────────
@@ -293,23 +380,64 @@
       function drawBubble(x, y, color, r = R) {
         ctx.beginPath();
         ctx.arc(x, y, r, 0, Math.PI * 2);
-        const g = ctx.createRadialGradient(
-          x - r * 0.35,
-          y - r * 0.35,
-          r * 0.04,
-          x,
-          y,
-          r,
-        );
-        g.addColorStop(0, lgt(color, 80));
-        g.addColorStop(0.5, color);
-        g.addColorStop(1, drk(color, 50));
-        ctx.fillStyle = g;
-        ctx.fill();
-        ctx.strokeStyle = drk(color, 70);
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        // shine highlight
+
+        if (color === WILD) {
+          ctx.fillStyle = '#f0f0ff';
+          ctx.fill();
+          const t = performance.now() / 600;
+          const g = ctx.createLinearGradient(x - r, y - r, x + r, y + r);
+          g.addColorStop(0, `hsl(${(t * 60) % 360},100%,60%)`);
+          g.addColorStop(0.5, `hsl(${(t * 60 + 120) % 360},100%,60%)`);
+          g.addColorStop(1, `hsl(${(t * 60 + 240) % 360},100%,60%)`);
+          ctx.strokeStyle = g;
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        } else if (color === STONE) {
+          const g = ctx.createRadialGradient(
+            x - r * 0.35,
+            y - r * 0.35,
+            r * 0.04,
+            x,
+            y,
+            r,
+          );
+          g.addColorStop(0, '#ccc');
+          g.addColorStop(0.5, STONE);
+          g.addColorStop(1, '#444');
+          ctx.fillStyle = g;
+          ctx.fill();
+          ctx.strokeStyle = '#333';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.save();
+          ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(x - r * 0.1, y - r * 0.5);
+          ctx.lineTo(x + r * 0.4, y + r * 0.3);
+          ctx.moveTo(x - r * 0.4, y + r * 0.1);
+          ctx.lineTo(x + r * 0.1, y - r * 0.4);
+          ctx.stroke();
+          ctx.restore();
+        } else {
+          const g = ctx.createRadialGradient(
+            x - r * 0.35,
+            y - r * 0.35,
+            r * 0.04,
+            x,
+            y,
+            r,
+          );
+          g.addColorStop(0, lgt(color, 80));
+          g.addColorStop(0.5, color);
+          g.addColorStop(1, drk(color, 50));
+          ctx.fillStyle = g;
+          ctx.fill();
+          ctx.strokeStyle = drk(color, 70);
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+        // shine
         ctx.beginPath();
         ctx.arc(x - r * 0.3, y - r * 0.32, r * 0.2, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(255,255,255,0.4)';
@@ -363,11 +491,26 @@
         ctx.closePath();
       }
 
+      function drawOverlay(color, title, lines, footer) {
+        ctx.fillStyle = 'rgba(0,0,0,0.78)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.textAlign = 'center';
+        ctx.fillStyle = color;
+        ctx.font = 'bold 48px Arial';
+        ctx.fillText(title, W / 2, H / 2 - 70);
+        ctx.fillStyle = '#fff';
+        ctx.font = '20px Arial';
+        lines.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 - 18 + i * 30));
+        ctx.fillStyle = '#bbb';
+        ctx.font = '14px Arial';
+        ctx.fillText(footer, W / 2, H / 2 + 18 + lines.length * 30);
+      }
+
       function draw() {
         ctx.save();
         ctx.scale(scale, scale);
 
-        // Background gradient
+        // Background
         const bg = ctx.createLinearGradient(0, 0, 0, H);
         bg.addColorStop(0, '#0f3460');
         bg.addColorStop(1, '#16213e');
@@ -379,15 +522,16 @@
         ctx.fillRect(0, 0, W, TOP - 2);
         ctx.fillStyle = '#c0392b';
         ctx.fillRect(0, TOP - 4, W, 4);
-        // Title in ceiling
         ctx.fillStyle = '#fff';
-        ctx.font = 'bold 15px Arial';
         ctx.textAlign = 'center';
-        ctx.letterSpacing = '3px';
-        ctx.fillText('BUBBLES', W / 2, TOP / 2 + 5);
-        ctx.letterSpacing = '0px';
+        ctx.font = 'bold 13px Arial';
+        ctx.fillText(
+          `BUBBLES  —  ETAPA ${stage} / ${MAX_STAGES}`,
+          W / 2,
+          TOP / 2 + 5,
+        );
 
-        // Danger zone dashed line
+        // Danger line
         const dangerY = by(ROWS - 3);
         ctx.save();
         ctx.setLineDash([8, 6]);
@@ -403,10 +547,12 @@
         ctx.fillStyle = '#0d1b3e';
         ctx.fillRect(0, SY + R + 12, W, H - SY - R - 12);
 
-        // Grid bubbles
-        for (let r = 0; r < ROWS; r++)
+        // Grid
+        for (let r = 0; r < ROWS; r++) {
+          if (!grid[r]) continue;
           for (let c = 0; c < ncols(r); c++)
             if (grid[r][c]) drawBubble(bx(r, c), by(r), grid[r][c]);
+        }
 
         // Particles
         for (const p of particles) {
@@ -419,7 +565,7 @@
         ctx.globalAlpha = 1;
 
         if (state === 'play') {
-          if (!cur.moving) drawAimLine();
+          drawAimLine();
 
           // Shooter ring
           ctx.beginPath();
@@ -430,23 +576,46 @@
           ctx.lineWidth = 3;
           ctx.stroke();
 
-          // Bubble: in shooter when idle, in flight when moving
           if (!cur.moving) drawBubble(SX, SY, cur.color);
           else drawBubble(cur.x, cur.y, cur.color);
+
+          // Wildcard button
+          ctx.beginPath();
+          ctx.arc(WBTN.x, WBTN.y, WBTN.r, 0, Math.PI * 2);
+          ctx.fillStyle = wildcards > 0 ? '#0a2a1a' : '#111';
+          ctx.fill();
+          ctx.strokeStyle = wildcards > 0 ? '#2ecc71' : '#333';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          if (wildcards > 0) {
+            drawBubble(WBTN.x, WBTN.y - 2, WILD, 10);
+            ctx.fillStyle = '#f1c40f';
+            ctx.font = 'bold 9px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('x' + wildcards, WBTN.x, WBTN.y + 13);
+          } else {
+            ctx.fillStyle = '#444';
+            ctx.font = 'bold 10px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('W', WBTN.x, WBTN.y + 4);
+          }
         }
 
-        // HUD – score
+        // HUD – scores (top left)
         ctx.fillStyle = 'rgba(0,0,0,0.6)';
-        roundRect(5, 5, 148, 33, 6);
+        roundRect(5, 5, 110, 33, 6);
         ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 16px Arial';
         ctx.textAlign = 'left';
-        ctx.fillText('Puntos: ' + score, 14, 26);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 11px Arial';
+        ctx.fillText('TOTAL: ' + totalScore, 12, 19);
+        ctx.fillStyle = '#aaa';
+        ctx.font = '10px Arial';
+        ctx.fillText('ETAPA: +' + stageScore, 12, 32);
 
-        // HUD – next bubble
+        // HUD – next bubble (top right)
         ctx.fillStyle = 'rgba(0,0,0,0.6)';
-        roundRect(W - 115, 5, 110, 33, 6);
+        roundRect(W - 110, 5, 105, 33, 6);
         ctx.fill();
         ctx.fillStyle = '#aaa';
         ctx.font = '13px Arial';
@@ -454,32 +623,92 @@
         ctx.fillText('Siguiente:', W - 32, 25);
         drawBubble(W - 16, 21, nxt.color, 13);
 
-        // Game over / win overlay
-        if (state !== 'play') {
-          ctx.fillStyle = 'rgba(0,0,0,0.72)';
+        // Streak multiplier
+        if (streakTimer > 0 && streak >= 2) {
+          const multi = streak >= 5 ? 3 : streak >= 3 ? 2 : 1;
+          const alpha = Math.min(streakTimer / 30, 1);
+          const color =
+            streak >= 5 ? '#e74c3c' : streak >= 3 ? '#f1c40f' : '#2ecc71';
+          ctx.globalAlpha = alpha;
+          ctx.textAlign = 'center';
+          ctx.fillStyle = color;
+          ctx.font = `bold ${22 + streak * 2}px Arial`;
+          ctx.fillText(`x${multi}  COMBO!`, W / 2, SY - 55);
+          ctx.globalAlpha = 1;
+        }
+
+        // ── Overlays ───────────────────────────────────────────────────────────
+        if (state === 'clear') {
+          ctx.fillStyle = 'rgba(0,0,0,0.80)';
           ctx.fillRect(0, 0, W, H);
           ctx.textAlign = 'center';
-          ctx.fillStyle = state === 'win' ? '#2ecc71' : '#e74c3c';
-          ctx.font = 'bold 52px Arial';
-          ctx.fillText(
-            state === 'win' ? 'GANASTE!' : 'GAME OVER',
-            W / 2,
-            H / 2 - 45,
-          );
+          ctx.fillStyle = '#f1c40f';
+          ctx.font = 'bold 40px Arial';
+          ctx.fillText(`ETAPA ${stage}`, W / 2, H / 2 - 95);
+          ctx.fillStyle = '#2ecc71';
+          ctx.font = 'bold 26px Arial';
+          ctx.fillText('COMPLETADA!', W / 2, H / 2 - 58);
           ctx.fillStyle = '#fff';
-          ctx.font = '22px Arial';
-          ctx.fillText('Puntos: ' + score, W / 2, H / 2 + 8);
+          ctx.font = '17px Arial';
+          ctx.fillText(`Puntos esta etapa: ${stageScore}`, W / 2, H / 2 - 16);
+          ctx.fillText(`Total acumulado: ${totalScore}`, W / 2, H / 2 + 14);
+          ctx.fillStyle = '#2ecc71';
+          ctx.font = '14px Arial';
+          ctx.fillText('+ 1 burbuja comodin desbloqueada', W / 2, H / 2 + 50);
+          if (stage < MAX_STAGES) {
+            const nc = stageCfg(stage + 1);
+            ctx.fillStyle = '#6a9abf';
+            ctx.font = '12px Arial';
+            ctx.fillText(
+              `Siguiente: ${nc.colors.length} colores · ${nc.initRows} filas · presión c/${nc.dropEvery} disparos` +
+                (nc.stoneChance > 0 ? ' · PIEDRAS' : ''),
+              W / 2,
+              H / 2 + 78,
+            );
+          }
           ctx.fillStyle = '#bbb';
-          ctx.font = '15px Arial';
-          ctx.fillText('Haz clic para reiniciar', W / 2, H / 2 + 50);
+          ctx.font = '14px Arial';
+          ctx.fillText('Haz clic para continuar', W / 2, H / 2 + 108);
+        } else if (state === 'win') {
+          drawOverlay(
+            '#f1c40f',
+            'GANASTE!',
+            [
+              `Puntuacion final: ${totalScore}`,
+              `¡Completaste las ${MAX_STAGES} etapas!`,
+            ],
+            'Haz clic para jugar de nuevo',
+          );
+        } else if (state === 'over') {
+          drawOverlay(
+            '#e74c3c',
+            'GAME OVER',
+            [
+              `Etapa: ${stage} / ${MAX_STAGES}`,
+              `Total: ${totalScore + stageScore}`,
+            ],
+            'Haz clic para jugar de nuevo',
+          );
         }
 
         ctx.restore();
       }
 
       // ── Init ───────────────────────────────────────────────────────────────────
-      function init() {
-        score = 0;
+      function startGame() {
+        stage = 1;
+        totalScore = 0;
+        wildcards = 0;
+        startStage();
+      }
+
+      function startStage() {
+        cfg = stageCfg(stage);
+        stageScore = 0;
+        dropParity = 0;
+        shotCount = 0;
+        streak = 0;
+        streakTimer = 0;
         state = 'play';
         particles = [];
         mx = SX;
@@ -488,11 +717,25 @@
         grid = Array.from({ length: ROWS }, (_, r) =>
           new Array(ncols(r)).fill(null),
         );
-        for (let r = 0; r < INIT_ROWS; r++)
-          for (let c = 0; c < ncols(r); c++) grid[r][c] = rndColor();
+        for (let r = 0; r < cfg.initRows; r++)
+          for (let c = 0; c < ncols(r); c++) grid[r][c] = rndCfgColor();
 
-        cur = { x: SX, y: SY, vx: 0, vy: 0, color: rndColor(), moving: false };
-        nxt = { x: 0, y: 0, vx: 0, vy: 0, color: rndColor(), moving: false };
+        cur = {
+          x: SX,
+          y: SY,
+          vx: 0,
+          vy: 0,
+          color: cfg.colors[Math.floor(Math.random() * cfg.colors.length)],
+          moving: false,
+        };
+        nxt = {
+          x: 0,
+          y: 0,
+          vx: 0,
+          vy: 0,
+          color: cfg.colors[Math.floor(Math.random() * cfg.colors.length)],
+          moving: false,
+        };
       }
 
       function loop() {
@@ -510,27 +753,42 @@
         };
       }
 
+      function handleTap(p) {
+        if (state === 'clear') {
+          wildcards++;
+          stage++;
+          startStage();
+          return;
+        }
+        if (state !== 'play') {
+          startGame();
+          return;
+        }
+        if (
+          wildcards > 0 &&
+          Math.hypot(p.x - WBTN.x, p.y - WBTN.y) < WBTN.r + 6
+        ) {
+          useWildcard();
+          return;
+        }
+        fire();
+      }
+
       canvas.addEventListener('mousemove', (e) => {
         const p = gameCoords(e.clientX, e.clientY);
         mx = p.x;
         my = p.y;
       });
+      canvas.addEventListener('click', (e) =>
+        handleTap(gameCoords(e.clientX, e.clientY)),
+      );
 
-      canvas.addEventListener('click', () => {
-        if (state !== 'play') {
-          init();
-          return;
-        }
-        fire();
-      });
-
-      // Touch: arrastrar para apuntar, soltar para disparar
       canvas.addEventListener(
         'touchstart',
         (e) => {
           e.preventDefault();
-          const t = e.touches[0];
-          const p = gameCoords(t.clientX, t.clientY);
+          const t = e.touches[0],
+            p = gameCoords(t.clientX, t.clientY);
           mx = p.x;
           my = p.y;
         },
@@ -541,8 +799,8 @@
         'touchmove',
         (e) => {
           e.preventDefault();
-          const t = e.touches[0];
-          const p = gameCoords(t.clientX, t.clientY);
+          const t = e.touches[0],
+            p = gameCoords(t.clientX, t.clientY);
           mx = p.x;
           my = p.y;
         },
@@ -553,16 +811,17 @@
         'touchend',
         (e) => {
           e.preventDefault();
-          if (state !== 'play') {
-            init();
-            return;
-          }
-          fire();
+          const t = e.changedTouches[0];
+          handleTap(gameCoords(t.clientX, t.clientY));
         },
         { passive: false },
       );
 
-      init();
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'w' || e.key === 'W') useWildcard();
+      });
+
+      startGame();
       loop();
     </script>
   </body>
